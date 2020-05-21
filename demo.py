@@ -18,6 +18,7 @@ PROJECT_FOLDER = os.path.dirname(os.path.realpath(__file__))
 PYTHON_EXE = 'python'
 MODEL_FOLDER = os.path.join(PROJECT_FOLDER, 'models')
 DATA_FOLDER = os.path.join(PROJECT_FOLDER, 'data')
+REDDIT_FOLDER = os.path.join(PROJECT_FOLDER, 'reddit_extractor')
 
 print(f'PROJECT_FOLDER = {PROJECT_FOLDER}')
 
@@ -64,13 +65,11 @@ if dargs.data == 'dummy':
     cmd = 'bash prepare4db.sh'
     ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=DATA_FOLDER)
 elif dargs.data == 'small':
-    myCmd = os.popen('cd reddit_extractor; make -j 8; cd ..').read()
-    cmd = 'gzip -d ./train.tsv.gz'
-    ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=DATA_FOLDER)
+    cmd = 'make -j 8'
+    ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=REDDIT_FOLDER)
 elif dargs.data == 'full':
-    myCmd = os.popen('cd reddit_extractor; SIZE=full make -j 8; cd ..').read()
-    cmd = 'gzip -d ./train.tsv.gz'
-    ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=DATA_FOLDER)
+    cmd = 'SIZE=full make -j 8'
+    ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=REDDIT_FOLDER)
 else:
     raise ValueError('you need to implement your own data type, or use either dummy, small, or full')
 
@@ -109,7 +108,7 @@ args = [
     '--output_dir', os.path.join(MODEL_FOLDER, 'output_model'),
     '--seed', '42',
     '--max_seq_length', '128',
-    '--train_batch_size', '512',
+    '--train_batch_size', '256',
     '--gradient_accumulation_steps', '8',
     '--eval_batch_size', '64',
     '--learning_rate', '1e-5',
