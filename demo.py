@@ -24,10 +24,14 @@ print(f'PROJECT_FOLDER = {PROJECT_FOLDER}')
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', type=str, default='dummy',
-                    help='choose from dummy, small and full')
+                    help='choose from dummy, small, full, custom')
+parser.add_argument('--train', type=str, default='train_dummy.tsv',
+                    help='train data file name')
+parser.add_argument('--valid', type=str, default='valid_dummy.tsv',
+                    help='valid data file name')
 dargs = parser.parse_args()
 
-assert dargs.data == 'dummy' or dargs.data == 'small' or dargs.data == 'full' , \
+assert dargs.data == 'dummy' or dargs.data == 'small' or dargs.data == 'full' or dargs.data == 'custom', \
     'The specified data option is not support!'
 
 
@@ -53,7 +57,7 @@ download_model = partial(download_model_folder, DATA_FOLDER=MODEL_FOLDER)
 # model size:  could be one of 'small' (GPT2 with 117M), 'medium'(345M) or 'large' (1542M)
 # dataset: one of 'multiref' or 'dstc'
 # from_scratch: True : load model trained from scratch or False: load model trained from fine-tuning the GPT-2
-target_folder = download_model(model_size='small', dataset='multiref', from_scratch=False)
+target_folder = download_model(model_size='medium', dataset='multiref', from_scratch=False)
 logger.info('Done!\n')
 
 
@@ -70,6 +74,9 @@ elif dargs.data == 'small':
 elif dargs.data == 'full':
     cmd = 'SIZE=full make -j 8'
     ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=REDDIT_FOLDER)
+elif dargs.data == 'custom':
+    cmd = 'ls -l'
+    ret = sp.run(cmd.split(' '), stdout=sp.PIPE, stderr=sp.STDOUT, cwd=DATA_FOLDER)
 else:
     raise ValueError('you need to implement your own data type, or use either dummy, small, or full')
 
@@ -78,7 +85,7 @@ if ret.returncode != 0:
     sys.exit(ret.returncode)
 
 logger.info('Preparing Data...')
-data_path = os.path.join(DATA_FOLDER, 'train.tsv')
+data_path = os.path.join(DATA_FOLDER, dargs.train)
 MAX_LEN = 128
 data_db = f'{data_path[:-4]}.{MAX_LEN}len.db'
 if os.path.isdir(data_db):
@@ -104,17 +111,17 @@ args = [
     '--model_name_or_path', target_folder,
     '--init_checkpoint', os.path.join(target_folder, 'pytorch_model.bin'),
     '--train_input_file', data_db ,  # file from last step
-    '--eval_input_file', './data/dummy_data.tsv',   # dummy test data
+    '--eval_input_file', os.path.join(DATA_FOLDER, dargs.valid),   # test data
     '--output_dir', os.path.join(MODEL_FOLDER, 'output_model'),
     '--seed', '42',
     '--max_seq_length', '128',
-    '--train_batch_size', '256',
+    '--train_batch_size', '48',
     '--gradient_accumulation_steps', '8',
-    '--eval_batch_size', '64',
+    '--eval_batch_size', '48',
     '--learning_rate', '1e-5',
-    '--num_optim_steps', '10000',
-    '--valid_step', '5000',
-    '--warmup_steps', '4000',
+    '--num_optim_steps', '200000',
+    '--valid_step', '10000',
+    '--warmup_steps', '20000',
     '--normalize_data', 'true',
     '--fp16', 'true',
     '--lr_schedule', 'noam',
