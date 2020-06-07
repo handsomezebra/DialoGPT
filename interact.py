@@ -145,7 +145,7 @@ def run_model():
     #### load the GPT-2 model 
     config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
     enc = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
-    model = load_model(GPT2LMHeadModel(config), args.load_checkpoint, args, verbose=True)
+    model = load_model(GPT2LMHeadModel(config), args.load_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
     model.to(device)
     model.eval()
 
@@ -153,7 +153,6 @@ def run_model():
     while True:
         raw_text = input("USR >>> ")
         while not raw_text:
-            print('Prompt should not be empty!')
             raw_text = input("USR >>> ")
         history.append(raw_text)
         context_tokens = sum([enc.encode(h) + [EOS_ID] for h in history],[]) #+ [EOS_ID]
@@ -162,9 +161,9 @@ def run_model():
 
         out = generate_sequence(model, context_tokens, position_ids=position_ids,
                                 length=args.generation_length, temperature=args.temperature, 
-                                top_k=args.top_k, top_p= args.top_p) 
+                                top_k=args.top_k, top_p=args.top_p) 
 
-        out = out.tolist()                        
+        out = out.tolist()
         text = enc.decode(cut_seq_to_eos(out[0])).encode('ascii','ignore').decode('ascii')
         print("BOT >>>", text)
         history.append(text)
@@ -184,7 +183,7 @@ if __name__ == '__main__':
 
 
     if os.path.exists(MODEL_FOLDER):
-        print('Found existing ./models folder, skip creating a new one!')
+        logger.info('Found existing ./models folder, skip creating a new one!')
         os.makedirs(MODEL_FOLDER, exist_ok=True)
     else:
         os.makedirs(MODEL_FOLDER)

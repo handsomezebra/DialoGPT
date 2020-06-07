@@ -15,9 +15,7 @@ logger = logging.getLogger(__name__)
 SEQ_LENGTH_SHRINK_PROP = 0.9
 
 
-def load_model(model, checkpoint, args, verbose=False):
-    n_gpu = args.n_gpu
-    device = args.device
+def load_model(model, checkpoint, n_gpu, device, fp16, verbose=False):
     if checkpoint is None or checkpoint == "None":
         if verbose:
             logger.info('no checkpoint provided for %s!' % model._get_name())
@@ -38,7 +36,7 @@ def load_model(model, checkpoint, args, verbose=False):
             start_model = model.transformer
         start_model.load_state_dict(model_state_dict)
 
-    if args.fp16:
+    if fp16:
         logger.info('in fp16, model.half() activated')
         model.half()
     model.to(device)

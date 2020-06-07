@@ -22,7 +22,7 @@ from gpt2_training.train_utils import get_eval_list_same_length, load_model, boo
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
-                    level = logging.INFO)
+                    level = logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -147,17 +147,19 @@ def run_model():
     #### load the GPT-2 model 
     config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
     enc = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
-    agent_model = load_model(GPT2LMHeadModel(config), args.agent_checkpoint, args, verbose=True)
+    agent_model = load_model(GPT2LMHeadModel(config), args.agent_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
     agent_model.to(device)
     agent_model.eval()
-    customer_model = load_model(GPT2LMHeadModel(config), args.customer_checkpoint, args, verbose=True)
+    customer_model = load_model(GPT2LMHeadModel(config), args.customer_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
     customer_model.to(device)
     customer_model.eval()
 
     history = ['start']
     print("CUSTOMER >>>", 'start')
-    while True:
-        time.sleep(1)
+    n = 0
+    while n < 20:
+        n += 1
+        time.sleep(0.5)
         context_tokens = sum([enc.encode(h) + [EOS_ID] for h in history],[])
         context_tokens = torch.tensor(context_tokens, device=device, dtype=torch.long).unsqueeze(0)
         position_ids = torch.arange(0, context_tokens.size(-1), dtype=torch.long, device=context_tokens.device)
@@ -166,13 +168,13 @@ def run_model():
                                 length=args.generation_length, temperature=args.temperature, 
                                 top_k=args.top_k, top_p=args.top_p) 
 
-        out = out.tolist()                        
+        out = out.tolist()
         text = enc.decode(cut_seq_to_eos(out[0])).encode('ascii','ignore').decode('ascii')
         print("AGENT    >>>", text)
         history.append(text)
         history = history[-(2*args.max_history+1):]
 
-        time.sleep(1)
+        time.sleep(0.5)
         context_tokens = sum([enc.encode(h) + [EOS_ID] for h in history],[])
         context_tokens = torch.tensor(context_tokens, device=device, dtype=torch.long).unsqueeze(0)
         position_ids = torch.arange(0, context_tokens.size(-1), dtype=torch.long, device=context_tokens.device)
@@ -181,7 +183,7 @@ def run_model():
                                 length=args.generation_length, temperature=args.temperature, 
                                 top_k=args.top_k, top_p=args.top_p) 
 
-        out = out.tolist()                        
+        out = out.tolist()
         text = enc.decode(cut_seq_to_eos(out[0])).encode('ascii','ignore').decode('ascii')
         print("CUSTOMER >>>", text)
         history.append(text)
