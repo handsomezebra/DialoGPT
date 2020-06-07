@@ -16,8 +16,8 @@ from demo_utils import download_model_folder
 import argparse
 import subprocess as sp
 
-from pytorch_pretrained_bert import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
-from gpt2_training.train_utils import get_eval_list_same_length, load_model, boolean_string, fix_state_dict_namespace
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+from gpt2_training.train_utils import boolean_string
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -25,92 +25,112 @@ logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(messa
 logger = logging.getLogger(__name__)
 
 
+# make sure it's the token id of <|endoftext|>
 EOS_ID = 50256
 
+def load_model(model, checkpoint, n_gpu, device, fp16, verbose=False):
+    if checkpoint is None or checkpoint == "None":
+        if verbose:
+            logger.info('no checkpoint provided for %s!' % model._get_name())
+    else:
+        if not os.path.exists(checkpoint):
+            raise ValueError('checkpoint %s not exist' % checkpoint)
+        if verbose:
+            logger.info('loading finetuned model from %s' % checkpoint)
+        model_state_dict = torch.load(checkpoint)
 
-def cut_seq_to_eos(sentence, remove_id=[-1]):
-    sent=[]
-    for s in sentence:
-        if s in remove_id:
-            continue
-        if s != EOS_ID:
-            sent.append(s)
-        else:
-            break
-    return sent
+        model_state_dict = fix_state_dict_namespace(model_state_dict)
+
+        #start_model = model
+        #if (hasattr(model, "transformer")
+        #    and all(not s.startswith('transformer.')
+        #            for s in model_state_dict.keys())):
+        #    logger.info('loading transformer only')
+        #    start_model = model.transformer
+        model.load_state_dict(model_state_dict)
+
+    if fp16:
+        logger.info('in fp16, model.half() activated')
+        model.half()
+    model.to(device)
+    if n_gpu > 1:
+        logging.info('data parallel because more than one gpu')
+        model = torch.nn.DataParallel(model)
+    return model
 
 
-### FROM HUGGING FACE REPO
-def top_filtering(logits, top_k=0, top_p=0.0, threshold=-float('Inf'), filter_value=-float('Inf')):
-    """ Filter a distribution of logits using top-k, top-p (nucleus) and/or threshold filtering
+def fix_state_dict_namespace(model_state_dict):
+    #print("Old keys: ", model_state_dict.keys())
+    old_keys = []
+    new_keys = []
+    for t in model_state_dict:
+        new_key = t
+        if t.startswith('module.'):
+            new_key = t.replace('module.', '')
+        old_keys.append(t)
+        new_keys.append(new_key)
+
+    for old_key, new_key in zip(old_keys, new_keys):
+        model_state_dict[new_key] = model_state_dict.pop(old_key)
+
+    model_state_dict['lm_head.weight'] = model_state_dict['lm_head.decoder.weight']
+    model_state_dict.pop('lm_head.decoder.weight', None)
+
+    #print("New keys: ", model_state_dict.keys())
+    return model_state_dict
+
+
+def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
         Args:
-            logits: logits distribution shape (vocabulary size)
-            top_k: <=0: no filtering, >0: keep only top k tokens with highest probability.
-            top_p: <=0.0: no filtering, >0.0: keep only a subset S of candidates, where S is the smallest subset
-                whose total probability mass is greater than or equal to the threshold top_p.
-                In practice, we select the highest probability tokens whose cumulative probability mass exceeds
-                the threshold top_p.
-            threshold: a minimal threshold to keep logits
+            logits: logits distribution shape (batch size x vocabulary size)
+            top_k > 0: keep only top k tokens with highest probability (top-k filtering).
+            top_p > 0.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+        From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
     """
-    assert logits.dim() == 1  # Only work for batch size 1 for now - could update but it would obfuscate a bit the code
-    top_k = min(top_k, logits.size(-1))
+    top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
-        # Remove all tokens with a probability less than the last token in the top-k tokens
+        # Remove all tokens with a probability less than the last token of the top-k
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
         logits[indices_to_remove] = filter_value
-
     if top_p > 0.0:
-        # Compute cumulative probabilities of sorted tokens
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probabilities = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
         # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probabilities > top_p
+        sorted_indices_to_remove = cumulative_probs > top_p
         # Shift the indices to the right to keep also the first token above the threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
-
-        # Back to unsorted indices and set them to -infinity
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        # scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=1, index=sorted_indices, src=sorted_indices_to_remove)
         logits[indices_to_remove] = filter_value
-
-    indices_to_remove = logits < threshold
-    logits[indices_to_remove] = filter_value
     return logits
 
-def generate_next_token(model, input_ids, position_ids=None, token_type_ids=None, prev=None, temperature=1, top_k=0, top_p=0, past=None):
+
+def sample_sequence(model, tokenizer, context_ids, device, num_samples, max_length, temperature, top_k, top_p):
+    # Parse parameters
+    context_tensor = torch.tensor(context_ids, dtype=torch.long, device=device)
+    context_tensor = context_tensor.unsqueeze(0).repeat(num_samples, 1)
+    generated = context_tensor
     with torch.no_grad():
-        if not past:
-            hidden_states, past = model.transformer(prev, position_ids, token_type_ids, past=past)
-        else:
-            hidden_states, past = model.transformer(prev, past=past)
-        #print("shape of hidden_states", hidden_states.shape)
-        logits = model.lm_head(hidden_states)
-        logits = logits[0, -1, :] / temperature
-        logits = top_filtering(logits, top_k=top_k, top_p=top_p)
-        probs = F.softmax(logits.unsqueeze(0), dim=-1)
-        prev = torch.multinomial(probs, num_samples=1)
-        return prev, probs[0][prev], past
-
-def generate_sequence(model, input_ids, position_ids=None, token_type_ids=None, temperature=1, top_k=0, top_p=0, length=20, past=None, device='cuda'):
-    output = input_ids.new_zeros([input_ids.size(0),0])
-    prev = input_ids
-    for i in range(length):
-        prev, probs, past = generate_next_token(model, input_ids, position_ids, token_type_ids, prev, temperature, top_k, top_p, past)
-        output = torch.cat((output, prev), dim=1)
-    return output
-
-def cut_seq_to_eos(sentence, remove_id=[-1]):
-    sent=[]
-    for s in sentence:
-        if s in remove_id:
-            continue
-        if s != EOS_ID:
-            sent.append(s)
-        else:
-            break
-    return sent
-
+        while True:
+            inputs = {'input_ids': generated}
+            outputs = model(**inputs)  # Note: we could also use 'past' with GPT-2/Transfo-XL/XLNet/CTRL (cached hidden-states)
+            next_token_logits = outputs[0][:, -1, :] / (temperature if temperature > 0 else 1.)
+            filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+            if temperature == 0.0: # greedy sampling:
+                next_token = torch.argmax(filtered_logits, dim=-1).unsqueeze(-1)
+            else:
+                next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            generated = torch.cat((generated, next_token), dim=1)
+            if (generated[:, len(context_ids):] == tokenizer.eos_token_id).any(dim=1).all():
+                # EOS token id found in each sample
+                break
+            if generated.shape[1] - len(context_ids) >= max_length:
+                # Maximum length reached
+                break
+    return generated
 
 def run_model():
     parser = argparse.ArgumentParser()
@@ -118,14 +138,14 @@ def run_model():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--load_checkpoint", '-c', type=str, default='')
     parser.add_argument("--fp16", type=boolean_string, default=False)
-    parser.add_argument("--max_seq_length", type=int, default=128)
     
     parser.add_argument("--generation_length", type=int, default=20)
     parser.add_argument("--max_history", type=int, default=2)
 
-    parser.add_argument("--temperature", type=float, default=1)
-    parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--number_of_examples", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_k", type=int, default=40)
+    parser.add_argument("--top_p", type=float, default=0.0)
 
     parser.add_argument('--use_gpu', action='store_true')
     parser.add_argument("--gpu", type=int, default=0)
@@ -144,30 +164,39 @@ def run_model():
 
     #### load the GPT-2 model 
     config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
-    enc = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
     model = load_model(GPT2LMHeadModel(config), args.load_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
     model.to(device)
     model.eval()
 
     history = []
+
     while True:
         raw_text = input("USR >>> ")
         while not raw_text:
             raw_text = input("USR >>> ")
         history.append(raw_text)
-        context_tokens = sum([enc.encode(h) + [EOS_ID] for h in history],[]) #+ [EOS_ID]
-        context_tokens = torch.tensor(context_tokens, device=device, dtype=torch.long).unsqueeze(0)
-        position_ids = torch.arange(0, context_tokens.size(-1), dtype=torch.long, device=context_tokens.device)
 
-        out = generate_sequence(model, context_tokens, position_ids=position_ids,
-                                length=args.generation_length, temperature=args.temperature, 
-                                top_k=args.top_k, top_p=args.top_p) 
+        context_ids = sum([tokenizer.encode(h) + [EOS_ID] for h in history],[])
 
-        out = out.tolist()
-        text = enc.decode(cut_seq_to_eos(out[0])).encode('ascii','ignore').decode('ascii')
-        print("BOT >>>", text)
-        history.append(text)
+        samples = sample_sequence(model, tokenizer, context_ids, 
+                                  device, args.number_of_examples, args.generation_length, 
+                                  args.temperature, args.top_k, args.top_p)
+        samples = samples[:, len(context_ids):].tolist()
+
+        texts = []
+        for sample in samples:
+            text = tokenizer.decode(sample, clean_up_tokenization_spaces=True)
+            text = text[: text.find(tokenizer.eos_token)]
+            texts.append(text)
+
+        for t in texts:
+            print("    >>>", t)
+        
+        print("BOT >>>", texts[0])
+        history.append(texts[0])
         history = history[-(2*args.max_history+1):]
+
 
 if __name__ == '__main__':
 
