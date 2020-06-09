@@ -192,7 +192,7 @@ eval_dataloader_gen = get_eval_list_same_length(
 # Prepare Model and Optimizer
 ##########################################################################
 model = load_model(GPT2LMHeadModel(config), args.init_checkpoint,
-                   args, verbose=True)
+                   args.n_gpu, args.device, args.fp16, verbose=True)
 if args.local_rank != -1:
     # when from scratch make sure initial models are the same
     params = [p.data for p in model.parameters()]

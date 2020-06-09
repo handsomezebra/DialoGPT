@@ -10,14 +10,16 @@ import numpy as np
 import socket
 import os, sys
 import re
-import logging
+import string
 from functools import partial
 from demo_utils import download_model_folder
 import argparse
 import subprocess as sp
+from nltk.corpus import stopwords
 
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
 from gpt2_training.train_utils import boolean_string
+from get_embedding import download_embedding
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -54,7 +56,7 @@ def load_model(model, checkpoint, n_gpu, device, fp16, verbose=False):
         model.half()
     model.to(device)
     if n_gpu > 1:
-        logging.info('data parallel because more than one gpu')
+        logger.info('data parallel because more than one gpu')
         model = torch.nn.DataParallel(model)
     return model
 
@@ -132,7 +134,75 @@ def sample_sequence(model, tokenizer, context_ids, device, num_samples, max_leng
                 break
     return generated
 
-def run_model():
+additional_stopwords = ["okay", "ok", "yeah"]
+re_stopwords = re.compile(r'\b(' + r'|'.join(stopwords.words('english') + additional_stopwords) + r')\b\s*')
+re_punctuation = re.compile('[%s]' % re.escape(string.punctuation))
+def filter_utterances(utterance_list):
+    def process_utterance(utt):
+        utt = utt.lower()
+        utt = re_stopwords.sub('', utt)
+        utt = re_punctuation.sub('', utt)
+        return utt
+        
+    processed_utterance_list = [process_utterance(x) for x in utterance_list]
+
+    utterance_list = [x[0] for x in zip(utterance_list, processed_utterance_list) if len(x[1]) > 8]
+    return utterance_list
+
+def cluster_utterances(utterance_list):
+    grouping_similarity_threshold = 0.7
+    def get_similar(sent_vectors, idx, idx_start, threshold):
+        # get similar vectors starting from idx_start to specified vector at idx
+        assert 0 <= idx < idx_start <= len(sent_vectors), "Invalid values %d %d %d" % (idx, idx_start, len(sent_vectors))
+        if idx_start == len(sent_vectors):
+            return
+
+        sim_list = np.dot(sent_vectors[idx_start:], sent_vectors[idx])
+
+        for i, s in enumerate(sim_list):
+            if s >= threshold:
+                yield idx_start + i, s
+
+    utterance_list = filter_utterances(utterance_list)
+
+    sent_vectors = download_embedding(utterance_list)
+    assert len(sent_vectors) == len(utterance_list)
+
+    # normalize sentence vectors
+    sent_vectors = sent_vectors / np.linalg.norm(sent_vectors, axis=1, keepdims=True)
+
+    # initialize the cluster result as one utterance per cluster
+    cluster_result = [{"utterances": [i], "score": 1.0} for i, _ in enumerate(utterance_list)]
+
+    for idx1, result1 in enumerate(cluster_result):
+        if "cluster" in result1:
+            # this result was already merged to another result
+            # skip it
+            continue
+
+        cluster_id = idx1
+
+        result1["cluster"] = cluster_id  # as the cluster id
+        for idx2, sim in get_similar(sent_vectors, idx1, idx1 + 1, grouping_similarity_threshold):
+            assert idx1 < idx2
+
+            result2 = cluster_result[idx2]
+            if "cluster" in result2:
+                continue
+
+            result2["cluster"] = cluster_id
+            result1["utterances"] += result2["utterances"]
+            result1["score"] += result2["score"]
+
+    # getting utterances whose cluster id is equal to the utterance id, i.e. the first utterance of the cluster
+    cluster_result = [{"utterances": x["utterances"], "score": x["score"]} for x in cluster_result if x["cluster"] == x["utterances"][0]]
+    cluster_result = sorted(cluster_result, key=lambda x: x["score"], reverse=True)
+
+    all_text = [utterance_list[x["utterances"][0]] for x in cluster_result]
+    popularity = [x["score"] for x in cluster_result]
+    return all_text, popularity
+
+def create_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default='', help='pretrained model name or path to local checkpoint')
     parser.add_argument("--seed", type=int, default=42)
@@ -140,7 +210,6 @@ def run_model():
     parser.add_argument("--fp16", type=boolean_string, default=False)
     
     parser.add_argument("--generation_length", type=int, default=20)
-    parser.add_argument("--max_history", type=int, default=2)
 
     parser.add_argument("--number_of_examples", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -150,24 +219,61 @@ def run_model():
     parser.add_argument('--use_gpu', action='store_true')
     parser.add_argument("--gpu", type=int, default=0)
 
-    args = parser.parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    return parser
 
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
-    n_gpu = torch.cuda.device_count()
-    args.device, args.n_gpu = device, n_gpu
+def random_seed(seed):
+    np.random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
-    np.random.seed(args.seed)
-    torch.random.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
 
-    #### load the GPT-2 model 
-    config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
-    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
-    model = load_model(GPT2LMHeadModel(config), args.load_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
-    model.to(device)
-    model.eval()
+class Interact(object):
+    def __init__(self):
+        parser = create_arg_parser()
+        args = parser.parse_args()
+
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+
+        device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
+        n_gpu = torch.cuda.device_count()
+        args.device, args.n_gpu = device, n_gpu
+        self.args = args
+
+        random_seed(args.seed)
+
+        #### load the GPT-2 model 
+        config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
+        self.tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
+
+        model = load_model(GPT2LMHeadModel(config), args.load_checkpoint, args.n_gpu, args.device, args.fp16, verbose=True)
+        model.to(device)
+        model.eval()
+        self.model = model
+
+    def get_response(self, history):
+        context_ids = sum([self.tokenizer.encode(h) + [EOS_ID] for h in history],[])
+
+        samples = sample_sequence(self.model, self.tokenizer, context_ids, 
+                                  self.args.device, self.args.number_of_examples, self.args.generation_length, 
+                                  self.args.temperature, self.args.top_k, self.args.top_p)
+
+        samples = samples[:, len(context_ids):].tolist()
+
+        texts = []
+        for sample in samples:
+            text = self.tokenizer.decode(sample, clean_up_tokenization_spaces=True)
+            text = text[: text.find(self.tokenizer.eos_token)]
+            texts.append(text)
+
+        clustered_texts, popularities = cluster_utterances(texts)
+
+        return clustered_texts, popularities
+
+
+def run_model():
+
+    interact_object = Interact()
 
     history = []
 
@@ -175,58 +281,19 @@ def run_model():
         raw_text = input("USR >>> ")
         while not raw_text:
             raw_text = input("USR >>> ")
+
         history.append(raw_text)
 
-        context_ids = sum([tokenizer.encode(h) + [EOS_ID] for h in history],[])
+        clustered_texts, popularities = interact_object.get_response(history)
 
-        samples = sample_sequence(model, tokenizer, context_ids, 
-                                  device, args.number_of_examples, args.generation_length, 
-                                  args.temperature, args.top_k, args.top_p)
-        samples = samples[:, len(context_ids):].tolist()
-
-        texts = []
-        for sample in samples:
-            text = tokenizer.decode(sample, clean_up_tokenization_spaces=True)
-            text = text[: text.find(tokenizer.eos_token)]
-            texts.append(text)
-
-        for t in texts:
-            print("    >>>", t)
+        for t, p in zip(clustered_texts, popularities):
+            print("    >>>", p, t)
         
-        print("BOT >>>", texts[0])
-        history.append(texts[0])
-        history = history[-(2*args.max_history+1):]
-
+        print("BOT >>>", clustered_texts[0])
+        history.append(clustered_texts[0])
+        history = history[-4:]
 
 if __name__ == '__main__':
-
-    PYTHON_EXE = 'python'
-    MODEL_FOLDER = './models'
-    DATA_FOLDER = './data'
-
-    logging.basicConfig(
-        format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO
-    )
-    logger = logging.getLogger(__name__)
-
-
-    if os.path.exists(MODEL_FOLDER):
-        logger.info('Found existing ./models folder, skip creating a new one!')
-        os.makedirs(MODEL_FOLDER, exist_ok=True)
-    else:
-        os.makedirs(MODEL_FOLDER)
-
-    #########################################################################
-    # Download Model
-    #########################################################################
-    logger.info('Downloading models...')
-    download_model = partial(download_model_folder, DATA_FOLDER=MODEL_FOLDER)
-
-    # model size:  could be one of 'small' (GPT2 with 117M), 'medium'(345M) or 'large' (1542M)
-    # dataset: one of 'multiref' or 'dstc'
-    # from_scratch: True : load model trained from scratch or False: load model trained from fine-tuning the GPT-2
-    target_folder = download_model(model_size='small', dataset='multiref', from_scratch=False)
-    logger.info('Done!\n')
-    
     run_model()
+
+
