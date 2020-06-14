@@ -2,22 +2,17 @@ import json
 from os.path import abspath, dirname, exists, join
 import argparse
 import logging
-from tqdm import trange
-import tqdm
 import torch
 import torch.nn.functional as F
 import numpy as np
-import socket
 import os, sys
 import re
 import string
-from functools import partial
-from demo_utils import download_model_folder
 import argparse
-import subprocess as sp
 from nltk.corpus import stopwords
-
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
+
+from demo_utils import download_model_folder
 from gpt2_training.train_utils import boolean_string
 from get_embedding import download_embedding
 
@@ -222,16 +217,12 @@ def create_arg_parser():
     return parser
 
 
-def random_seed(seed):
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
 
 
 class Interact(object):
-    def __init__(self):
+    def __init__(self, params=None):
         parser = create_arg_parser()
-        args = parser.parse_args()
+        args = parser.parse_args(params)
 
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
@@ -240,7 +231,7 @@ class Interact(object):
         args.device, args.n_gpu = device, n_gpu
         self.args = args
 
-        random_seed(args.seed)
+        self.random_seed()
 
         #### load the GPT-2 model 
         config = GPT2Config.from_json_file(os.path.join(args.model_name_or_path, 'config.json'))
@@ -251,17 +242,31 @@ class Interact(object):
         model.eval()
         self.model = model
 
+    def random_seed(self):
+        seed = self.args.seed
+        np.random.seed(seed)
+        torch.random.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
     def get_response(self, history):
         context_ids = sum([self.tokenizer.encode(h) + [EOS_ID] for h in history],[])
 
-        samples = sample_sequence(self.model, self.tokenizer, context_ids, 
-                                  self.args.device, self.args.number_of_examples, self.args.generation_length, 
-                                  self.args.temperature, self.args.top_k, self.args.top_p)
+        passes = 2
+        batch_size = self.args.number_of_examples // passes
 
-        samples = samples[:, len(context_ids):].tolist()
+        all_samples = []
+        for i in range(passes):
+            samples = sample_sequence(self.model, self.tokenizer, context_ids, 
+                                      self.args.device, batch_size, self.args.generation_length, 
+                                      self.args.temperature, self.args.top_k, self.args.top_p)
+            if self.args.use_gpu:
+                torch.cuda.empty_cache()
+            samples = samples[:, len(context_ids):].tolist()
+            all_samples += samples
+
 
         texts = []
-        for sample in samples:
+        for sample in all_samples:
             text = self.tokenizer.decode(sample, clean_up_tokenization_spaces=True)
             text = text[: text.find(self.tokenizer.eos_token)]
             texts.append(text)
